@@ -1,0 +1,323 @@
+---
+title: "House Gerrymandering Visualization"
+author: "Jordan Isaacs (jisaacs)"
+date: "10/16/2020"
+output:
+  html_document:
+      toc:  true
+      toc_float:  true
+      code_folding:  show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, message = F, warning = F}
+library(tidyverse)
+library(tidycensus)
+library(reshape2)
+library(gridExtra)
+library(sf)
+census_api_key("c056ebd4b54cffef27c51415099c17a03436ec92")
+```
+
+## Loading Data
+
+* House election data is from [MIT Election Data + Science lab](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/IG0UN2#)
+```{r, message = F, warning = F}
+current_legislators <- read_csv("https://theunitedstates.io/congress-legislators/legislators-current.csv")
+election_data.raw <- read_csv("./Data/1976-2018-house2.csv")
+
+get_acs.us_districts <- function(raw, years) {
+  i <- 1
+  variables = c(population = "B01003_001",
+                white_pop = "B02008_001",
+                black_pop = "B02009_001",
+                hisp_pop = "B03001_003",
+                asian_pop = "B02011_001",
+                native_pop = "B02010_001",
+                median_age = "B01002_001",
+                median_income_12mo = "B06011_001")
+  
+  for (year in years) {
+    data <- get_acs(geography = "congressional district",
+                    year = year,
+                    variables = variables,
+                    survey = "acs1")
+    geo <- get_acs(geography = "congressional district",
+                   year = year,
+                   survey = "acs1",
+                   variables = c("B01003_001"),
+                   geometry = TRUE)
+    raw[["vars"]][[as.character(year)]] <- data
+    raw[["geo"]][[as.character(year)]] <- geo
+  }
+  
+  
+  names(raw[["vars"]]) <- years
+  names(raw[["geo"]]) <- years
+  return (raw)
+}
+
+years <- seq(2012, 2018, by = 2)
+acs.us_districts.raw <- list(list())
+acs.us_districts.raw <- get_acs.us_districts(acs.us_districts.raw, years)
+# Minnesota uses/used affiliated parties
+fix_mn = function(party) {
+  if (is.na(party)) {
+    return (party)
+  }
+  if (party == "democratic-farmer-labor") {
+    return ("democrat")
+  } else if (party == "independent-republican") {
+    return ("republican")
+  } else {
+    return (party)
+  }
+}
+
+election_data.raw$party = election_data.raw$party %>% sapply(fix_mn)
+# Fix 0 district
+election_data.raw = election_data.raw %>% mutate(district = ifelse(district == 0, 1, district))
+```
+
+## Process Election Data
+
++ Process election data to only have the general election data for each two year period (ignore special elections)
++ Aggregate up all democrat, republican, and other votes. (Even if multiple from same party were running)
++ Votes for a party take precedence over candidate (if candidate is democrat and third party, votes go to the party the voter chose)
+```{r, message = F}
+get_demvotes = function(party, candidatevotes) {
+  return (sum(candidatevotes[party == "democrat"], na.rm = TRUE))
+}
+
+get_repubvotes = function(party, candidatevotes) {
+  return (sum(candidatevotes[party == "republican"], na.rm = TRUE))
+}
+
+get_othervotes = function(party, candidatevotes) {
+  return (sum(candidatevotes[!(party %in% c("democrat", "republican"))]))
+}
+
+election_data.processed <- election_data.raw %>%
+  filter(special == FALSE, stage == "gen") %>%
+  group_by(year, state_po, district, runoff) %>%
+  summarise(democrat = get_demvotes(party, candidatevotes),
+            republican = get_repubvotes(party, candidatevotes),
+            other = get_othervotes(party, candidatevotes),
+            total = max(totalvotes)) %>%
+  arrange(year, state_po, district, desc(runoff)) %>%
+  distinct(year, state_po, district, .keep_all = TRUE) %>%
+  rename(runoff_ranked = runoff)
+
+election_is_valid = function() {
+  for (i in 1:nrow(election_data.processed)) {
+    row = election_data.processed[i,]
+    demvotes = as.numeric(row[["democrat"]])
+    repubvotes = as.numeric(row[["republican"]])
+    othervotes = as.numeric(row[["other"]])
+    totalvotes = as.numeric(row[["total"]])
+    if (demvotes + repubvotes + othervotes != totalvotes ||
+        (demvotes == 0 && repubvotes == 0 && othervotes == 0)) {
+      cat("Invalid row (",  i, "):\n", sep = "")
+      print(as.character(row))
+    }
+  }
+}
+
+election_is_valid()
+```
+
+## Fix bad election data
+
++ Using data from [ballotpedia](https://ballotpedia.org/Main_Page)
++ For 2012 CT using [state election results](https://portal.ct.gov/-/media/SOTS/ElectionServices/ElectionResults/2012/2012ElectionResultspdf.pdf)
++ Maine votes are from final ranked choice
+```{r}
+# 6 missing other votes in this race
+election_data.processed[5799, 7] = election_data.processed[5799, 7] + 6
+
+# 1 vote extra in other and wrong total
+election_data.processed[7900, 7] = election_data.processed[7900, 7] - 1
+election_data.processed[7900, 8] = 73726 + 197163 + 20410
+
+# Missing 1 write in vote
+election_data.processed[8768, 7] = election_data.processed[8768, 7] + 1
+
+# Messed up from ranked choice voting, using final round
+election_data.processed[9319, 5] = 142440
+election_data.processed[9319, 6] = 138931
+
+# Setting runoff_ranked to true
+election_data.processed[9319, 4] = TRUE
+
+# Uncontested election that democrats one
+election_data.processed[8797, 5] = 1
+election_data.processed[8797, 8] = 1
+
+election_is_valid()
+```
+
+## 2020 house data
++ Using Jonathan's Cervas scraped NYT data
+```{r, message = F}
+house_2020 <- read_csv("https://raw.githubusercontent.com/jcervas/2020-Elections/main/house2020.csv")
+state_to_abbv <- function(state) {
+  return (state.abb[state.name == state])
+}
+
+house_2020$state = sapply(house_2020$state, state_to_abbv)
+house_2020$district = house_2020$district
+house_2020 = house_2020 %>% select(state, district, dem, rep, other, totalvotes) %>%
+  rename("democrat" = dem, "republican" = rep, "total" = totalvotes, "state_po" = state)
+house_2020$runoff_ranked = NA
+house_2020$year = 2020
+election_data.processed = rbind(election_data.processed, house_2020)
+```
+
+## Stylistically alter election data
+
++ Some elections are uncontested or extremely partisan (over 75% for a party). In this case give 75% of votes to the winning party and 25% to the missing/losing party (either democrat or republican).
++ Drop third party voting data unless they have majority of vote share (won the election)
++ Note: By dropping third party voting data we will lose the ability to analyze voter turnout 
+
+```{r}
+alter_row <- function(x) {
+  other = as.numeric(x[["other"]])
+  democrat = as.numeric(x[["democrat"]])
+  republican = as.numeric(x[["republican"]])
+  total = as.numeric(x[["total"]])
+  if (total == 0) {
+    return (c(democrat, republican, other, total));
+  }
+  if (other > democrat && other > republican) {
+    return (c(democrat, republican, other, total));
+  } else {
+    other = 0;
+    total = democrat + republican;
+    if (democrat / total > 0.75) {
+      return (c(democrat * 0.75, democrat * 0.25, 0, total));
+    } else if (republican / total > 0.75) {
+      return (c(republican * 0.25, republican * 0.75, 0, total));
+    }
+    return (c(democrat, republican, 0, total));
+  }
+}
+
+process_data <- function(data) {
+  processed = data %>% apply(., 1, alter_row) %>% t %>% as.data.frame
+  data$democrat = processed$V1
+  data$republican = processed$V2
+  data$other = processed$V3
+  data$total = processed$V4
+  return (data)
+}
+
+election_data.processed = process_data(election_data.processed)
+```
+
+
+- No third party has won since 2010. Mostly looking at data since 2010 so not going to research whether they caucused with a specific party.
+```{r}
+filter(election_data.processed, other != 0)
+filter(election_data.processed, runoff_ranked == TRUE)
+```
+
+
+
+
+## Reshape Election Data
+
++ Turn from wide into long format
+```{r}
+election_data <- melt(data = election_data.processed,
+                                id.vars = c("year", "state_po", "district"),
+                                measure.vars = c("republican", "democrat", 
+                                                 "other")) %>%
+  rename(party = variable, votes = value)
+```
+
+
+
+## Process Census data
+
++ Process the NAME column into State and District
++ Add a year column
+```{r}
+process_census_data <- function(population_data, geo_data, year, type) {
+  if (type == "acs") {
+    population_data <- population_data %>% select(NAME, variable, estimate) %>%
+      pivot_wider(., id_cols = c("NAME"), values_from = "estimate", names_from = "variable")
+  } else if (type == "dec") {
+    population_data <- population_data %>% select(state, district, value) %>%
+      rename(district = districts, population = value)
+  } else {
+    return (NA)
+  }
+  
+  population_data <- geo_data %>% select(NAME, geometry) %>%
+    right_join(., population_data, by = c("NAME"))
+  
+  state_matches = regexpr("(?<=, ).+", population_data$NAME, perl = TRUE)
+  population_data$state <- regmatches(population_data$NAME, state_matches)
+  population_data$state <- state.abb[match(population_data$state, state.name)]
+  
+  district_matches <- regexpr("(?<=District )[[:digit:]]+", population_data$NAME, perl = TRUE)
+  districts <- rep(0, length(district_matches))
+  districts[district_matches != -1] <- regmatches(population_data$NAME, district_matches)
+  population_data$district <- as.numeric(districts)
+  population_data = population_data %>% mutate(district = ifelse(district == 0, 1, district))
+  population_data$year = year
+  population_data = population_data %>% select(!NAME)
+  population_data <- st_zm(population_data)
+  return (population_data)
+}
+
+acs.us_districts.processed = list()
+for (year in years) {
+  acs.us_districts.processed[[as.character(year)]] <-
+    process_census_data(acs.us_districts.raw[["vars"]][[as.character(year)]],
+                        acs.us_districts.raw[["geo"]][[as.character(year)]],
+                        year, "acs")
+}
+
+```
+
+
+## Join the data together
+
++ Row bind the population data then left join election data
++ Essentially adding voting data to our district population data
+
+
+```{r}
+join_data <- function(population_data, election_data) {
+  combined_pop = population_data[[as.character(years[1])]]
+  for (year in years) {
+    if (year != years[1]) {
+      combined_pop = rbind(combined_pop, population_data[[as.character(year)]])
+    }
+  }
+  return (left_join(election_data, combined_pop, by=c("state_po" = "state",
+                                                  "district" = "district",
+                                                  "year" = "year")))
+}
+data <- join_data(acs.us_districts.processed,
+                  election_data)
+```
+
+## Save as CSV
+
+```{r}
+write_csv(data, path="house_census_data.csv")
+```
+
+## Save as R object
+```{r}
+save(data, file = "house_census_data.Rdata")
+```
+
+
+
